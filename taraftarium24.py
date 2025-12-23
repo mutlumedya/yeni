@@ -1,244 +1,121 @@
+import requests
+from bs4 import BeautifulSoup
 import re
-import sys
-import time
-from urllib.parse import urlparse, parse_qs, urljoin
-from playwright.sync_api import sync_playwright, Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
+import urllib3
 
-# Taraftarium ana domain'i
-TARAFTARIUM_DOMAIN = "https://taraftarium24.xyz/"
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Kullanılacak User-Agent
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
-
-# --- Varsayılan Kanal Bilgisini Alma Fonksiyonu (DEĞİŞİKLİK YOK) ---
-def scrape_default_channel_info(page):
-    print(f"\n📡 Varsayılan kanal bilgisi {TARAFTARIUM_DOMAIN} adresinden alınıyor...")
-    try:
-        # Ana sayfaya ilk gidiş. DOM'un yüklenmesini bekle.
-        page.goto(TARAFTARIUM_DOMAIN, timeout=25000, wait_until='domcontentloaded')
-
-        iframe_selector = "iframe#customIframe"
-        print(f"-> Varsayılan iframe ('{iframe_selector}') aranıyor...")
-        page.wait_for_selector(iframe_selector, timeout=15000) # Biraz daha bekle
-        iframe_element = page.query_selector(iframe_selector)
-
-        if not iframe_element:
-            print("❌ Ana sayfada 'iframe#customIframe' bulunamadı.")
-            return None, None
-
-        iframe_src = iframe_element.get_attribute('src')
-        if not iframe_src:
-            print("❌ Iframe 'src' özniteliği boş.")
-            return None, None
-
-        event_url = urljoin(TARAFTARIUM_DOMAIN, iframe_src)
-        parsed_event_url = urlparse(event_url)
-        query_params = parse_qs(parsed_event_url.query)
-        stream_id = query_params.get('id', [None])[0]
-
-        if not stream_id:
-            print(f"❌ Event URL'sinde ({event_url}) 'id' parametresi bulunamadı.")
-            return None, None
-
-        print(f"✅ Varsayılan kanal bilgisi alındı: ID='{stream_id}', EventURL='{event_url}'")
-        return event_url, stream_id
-
-    except Exception as e:
-        print(f"❌ Ana sayfaya ulaşılamadı veya iframe bilgisi alınamadı: {e.__class__.__name__} - {e}")
-        return None, None
-
-# --- M3U8 Base URL Çıkarma Fonksiyonu (DEĞİŞİKLİK YOK) ---
-def extract_base_m3u8_url(page, event_url):
-    try:
-        print(f"\n-> M3U8 Base URL'i almak için Event sayfasına gidiliyor: {event_url}")
-        page.goto(event_url, timeout=20000, wait_until="domcontentloaded")
-        content = page.content()
-        base_url_match = re.search(r"['\"](https?://[^'\"]+/checklist/)['\"]", content)
-        if not base_url_match:
-             base_url_match = re.search(r"streamUrl\s*=\s*['\"](https?://[^'\"]+/checklist/)['\"]", content)
-        if not base_url_match:
-            print(" -> ❌ Event sayfası kaynağında '/checklist/' ile biten base URL bulunamadı.")
-            return None
-        base_url = base_url_match.group(1)
-        print(f"-> ✅ M3U8 Base URL bulundu: {base_url}")
-        return base_url
-    except Exception as e:
-        print(f"-> ❌ Event sayfası işlenirken hata oluştu: {e}")
-        return None
-
-# --- TEKRAR GÜNCELLENEN FONKSİYON: Tüm Kanal Listesini Kazıma (YİNELENENLERE İZİN VER) ---
-def scrape_all_channels(page):
-    """
-    Taraftarium ana sayfasında JS'in yüklenmesini bekler ve TÜM kanalların
-    isimlerini ve ID'lerini (yinelenenler dahil) kazır.
-    """
-    print(f"\n📡 Tüm kanallar {TARAFTARIUM_DOMAIN} adresinden çekiliyor...")
-    channels = [] # Sonuç listesi
-    try:
-        print(f"-> Ana sayfaya gidiliyor ve ağ trafiğinin durması bekleniyor (Max 45sn)...")
-        page.goto(TARAFTARIUM_DOMAIN, timeout=45000, wait_until='networkidle')
-        print("-> Ağ trafiği durdu veya zaman aşımına yaklaşıldı.")
-
-        print("-> DOM güncellemeleri için 5 saniye bekleniyor...")
-        page.wait_for_timeout(5000)
-
-        mac_item_selector = ".mac[data-url]"
-        print(f"-> Sayfa içinde '{mac_item_selector}' elementleri var mı kontrol ediliyor...")
-
-        elements_exist = page.evaluate(f'''() => {{
-            return document.querySelector('{mac_item_selector}') !== null;
-        }}''')
-
-        if not elements_exist:
-            print(f"❌ Sayfa içinde '{mac_item_selector}' elemanları bulunamadı.")
-            return []
-
-        print("-> ✅ Kanallar sayfada mevcut. Bilgiler çıkarılıyor...")
-        channel_elements = page.query_selector_all(mac_item_selector)
-        print(f"-> {len(channel_elements)} adet potensiye kanal elemanı bulundu.")
-
-        # --- DEĞİŞİKLİK: processed_ids ve filtreleme kaldırıldı ---
-        for element in channel_elements:
-            name_element = element.query_selector(".takimlar")
-            channel_name = name_element.inner_text().strip() if name_element else "İsimsiz Kanal"
-            channel_name_clean = channel_name.replace('CANLI', '').strip()
-
-            data_url = element.get_attribute('data-url')
-            stream_id = None
-            if data_url:
-                try:
-                    parsed_data_url = urlparse(data_url)
-                    query_params = parse_qs(parsed_data_url.query)
-                    stream_id = query_params.get('id', [None])[0]
-                except Exception:
-                    pass
-
-            if stream_id: # Sadece ID varsa ekle
-                time_element = element.query_selector(".saat")
-                time_str = time_element.inner_text().strip() if time_element else None
-                if time_str and time_str != "CANLI":
-                     final_channel_name = f"{channel_name_clean} ({time_str})"
-                else:
-                     final_channel_name = channel_name_clean
-
-                # Direkt listeye ekle, ID kontrolü yok
-                channels.append({
-                    'name': final_channel_name,
-                    'id': stream_id
-                })
-        # --- DEĞİŞİKLİK BİTTİ ---
-
-        # Kanalları isme göre sırala (isteğe bağlı)
-        channels.sort(key=lambda x: x['name'])
-
-        print(f"✅ {len(channels)} adet kanal bilgisi başarıyla çıkarıldı (yinelenenler dahil).")
-        return channels
-
-    except Exception as e:
-        print(f"❌ Kanal listesi işlenirken hata oluştu: {e}")
-        return []
-
-# --- Gruplama Fonksiyonu (Güncellendi: Daha fazla anahtar kelime) ---
-def get_channel_group(channel_name):
-    channel_name_lower = channel_name.lower()
-    group_mappings = {
-        'BeinSports': ['bein sports', 'beın sports', ' bs', ' bein '],
-        'S Sports': ['s sport'],
-        'Tivibu': ['tivibu spor', 'tivibu'],
-        'Exxen': ['exxen'],
-        'Ulusal Kanallar': ['a spor', 'trt spor', 'trt 1', 'tv8', 'atv', 'kanal d', 'show tv', 'star tv', 'trt yıldız', 'a2'],
-        'Spor': ['smart spor', 'nba tv', 'eurosport', 'sport tv', 'premier sports', 'ht spor', 'sports tv'],
-        'Yarış': ['tjk tv'],
-        'Belgesel': ['national geographic', 'nat geo', 'discovery', 'dmax', 'bbc earth', 'history'],
-        'Film & Dizi': ['bein series', 'bein movies', 'movie smart', 'filmbox', 'sinema tv'],
-        'Haber': ['haber', 'cnn', 'ntv'],
-        'Diğer': ['gs tv', 'fb tv', 'cbc sport'] # Eşleşmeyenler ve kulüp kanalları
-    }
-    for group, keywords in group_mappings.items():
-        for keyword in keywords:
-            if keyword in channel_name_lower:
-                return group
-
-    # Maç isimlerini ayıklama (Lig bilgisine göre daha iyi olabilir ama şimdilik basit)
-    if re.search(r'\d{2}:\d{2}', channel_name): # İçinde saat varsa maçtır
-        return "Maç Yayınları"
-    if ' - ' in channel_name: # Takım ismi gibi görünüyorsa
-        return "Maç Yayınları"
-
-    return "Diğer Kanallar" # Kalanlar için varsayılan
-
-# --- Ana Fonksiyon ---
 def main():
-    with sync_playwright() as p:
-        print("🚀 Playwright ile Taraftarium24 M3U8 Kanal İndirici Başlatılıyor (Tüm Liste)...")
+    PROXY = "https://proxy.freecdn.workers.dev/?url="
+    START = "https://taraftariumizle.org/"
+    FILE_NAME = "taraftarium24.m3u"
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    }
 
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(user_agent=USER_AGENT)
-        page = context.new_page()
+    channels = [
+        ("androstreamlivebiraz1", 'TR:beIN Sport 1 HD'),
+        ("androstreamlivebs1", 'TR:beIN Sport 1 HD'),
+        ("androstreamlivebs2", 'TR:beIN Sport 2 HD'),
+        ("androstreamlivebs3", 'TR:beIN Sport 3 HD'),
+        ("androstreamlivebs4", 'TR:beIN Sport 4 HD'),
+        ("androstreamlivebs5", 'TR:beIN Sport 5 HD'),
+        ("androstreamlivebsm1", 'TR:beIN Sport Max 1 HD'),
+        ("androstreamlivebsm2", 'TR:beIN Sport Max 2 HD'),
+        ("androstreamlivess1", 'TR:S Sport 1 HD'),
+        ("androstreamlivess2", 'TR:S Sport 2 HD'),
+        ("androstreamlivets", 'TR:Tivibu Sport HD'),
+        ("androstreamlivets1", 'TR:Tivibu Sport 1 HD'),
+        ("androstreamlivets2", 'TR:Tivibu Sport 2 HD'),
+        ("androstreamlivets3", 'TR:Tivibu Sport 3 HD'),
+        ("androstreamlivets4", 'TR:Tivibu Sport 4 HD'),
+        ("androstreamlivesm1", 'TR:Smart Sport 1 HD'),
+        ("androstreamlivesm2", 'TR:Smart Sport 2 HD'),
+        ("androstreamlivees1", 'TR:Euro Sport 1 HD'),
+        ("androstreamlivees2", 'TR:Euro Sport 2 HD'),
+        ("androstreamlivetb", 'TR:Tabii HD'),
+        ("androstreamlivetb1", 'TR:Tabii 1 HD'),
+        ("androstreamlivetb2", 'TR:Tabii 2 HD'),
+        ("androstreamlivetb3", 'TR:Tabii 3 HD'),
+        ("androstreamlivetb4", 'TR:Tabii 4 HD'),
+        ("androstreamlivetb5", 'TR:Tabii 5 HD'),
+        ("androstreamlivetb6", 'TR:Tabii 6 HD'),
+        ("androstreamlivetb7", 'TR:Tabii 7 HD'),
+        ("androstreamlivetb8", 'TR:Tabii 8 HD'),
+        ("androstreamliveexn", 'TR:Exxen HD'),
+        ("androstreamliveexn1", 'TR:Exxen 1 HD'),
+        ("androstreamliveexn2", 'TR:Exxen 2 HD'),
+        ("androstreamliveexn3", 'TR:Exxen 3 HD'),
+        ("androstreamliveexn4", 'TR:Exxen 4 HD'),
+        ("androstreamliveexn5", 'TR:Exxen 5 HD'),
+        ("androstreamliveexn6", 'TR:Exxen 6 HD'),
+        ("androstreamliveexn7", 'TR:Exxen 7 HD'),
+        ("androstreamliveexn8", 'TR:Exxen 8 HD'),
+    ]
 
-        # 1. Adım: Varsayılan kanaldan event URL'sini ve ID'sini al
-        default_event_url, default_stream_id = scrape_default_channel_info(page)
-        if not default_event_url:
-            print("❌ UYARI: Varsayılan kanal bilgisi alınamadı, M3U8 Base URL bulunamıyor. İşlem sonlandırılıyor.")
-            browser.close()
-            sys.exit(1)
+    def get_src(u, ref=None):
+        try:
+            if ref: headers['Referer'] = ref
+            r = requests.get(PROXY + u, headers=headers, verify=False, timeout=20)
+            return r.text if r.status_code == 200 else None
+        except: return None
 
-        # 2. Adım: event.html'den M3U8 Base URL'ini çıkar
-        base_m3u8_url = extract_base_m3u8_url(page, default_event_url)
-        if not base_m3u8_url:
-            print("❌ UYARI: M3U8 Base URL alınamadı. İşlem sonlandırılıyor.")
-            browser.close()
-            sys.exit(1)
+    h1 = get_src(START)
+    if not h1: return
 
-        # 3. Adım: Ana sayfadaki tüm kanalları kazı
-        channels = scrape_all_channels(page)
-        if not channels:
-            print("❌ UYARI: Hiçbir kanal bulunamadı, işlem sonlandırılıyor.")
-            browser.close()
-            sys.exit(1)
+    s = BeautifulSoup(h1, 'html.parser')
+    lnk = s.find('link', rel='amphtml')
+    if not lnk: return
+    amp = lnk.get('href')
 
-        m3u_content = []
-        output_filename = "taraftarium24_kanallar.m3u8"
-        print(f"\n📺 {len(channels)} kanal için M3U8 linkleri oluşturuluyor...")
-        created = 0
+    h2 = get_src(amp)
+    if not h2: return
 
-        player_origin_host = TARAFTARIUM_DOMAIN.rstrip('/')
-        player_referer = TARAFTARIUM_DOMAIN
+    m = re.search(r'\[src\]="appState\.currentIframe".*?src="(https?://[^"]+)"', h2, re.DOTALL)
+    if not m: return
+    ifr = m.group(1)
 
-        m3u_header_lines = [
-            "#EXTM3U",
-            f"#EXT-X-USER-AGENT:{USER_AGENT}",
-            f"#EXT-X-REFERER:{player_referer}",
-            f"#EXT-X-ORIGIN:{player_origin_host}"
-        ]
+    h3 = get_src(ifr, ref=amp)
+    if not h3: return
 
-        for i, channel_info in enumerate(channels, 1):
-            channel_name = channel_info['name']
-            stream_id = channel_info['id']
-            # Gruplamayı ID'ye göre değil, isme göre yapalım
-            group_name = get_channel_group(channel_name)
+    bm = re.search(r'baseUrls\s*=\s*\[(.*?)\]', h3, re.DOTALL)
+    if not bm: return
 
-            m3u8_link = f"{base_m3u8_url}{stream_id}.m3u8"
+    cl = bm.group(1).replace('"', '').replace("'", "").replace("\n", "").replace("\r", "")
+    srvs = [x.strip() for x in cl.split(',') if x.strip().startswith("http")]
+    srvs = list(set(srvs)) # Benzersiz yap
 
-            # Konsola yazdırmayı azaltalım, sadece başarılı/başarısız yazsın
-            # print(f"[{i}/{len(channels)}] {channel_name} (ID: {stream_id}, Grup: {group_name}) -> {m3u8_link}")
+    active_servers = []
+    tid = "androstreamlivebs1" 
 
-            m3u_content.append(f'#EXTINF:-1 tvg-name="{channel_name}" group-title="{group_name}",{channel_name}')
-            m3u_content.append(m3u8_link)
-            created += 1
+    # Tüm sunucuları test et
+    for sv in srvs:
+        sv = sv.rstrip('/')
+        turl = f"{sv}/{tid}.m3u8" if "checklist" in sv else f"{sv}/checklist/{tid}.m3u8"
+        turl = turl.replace("checklist//", "checklist/")
+        
+        try:
+            headers['Referer'] = ifr
+            tr = requests.get(PROXY + turl, headers=headers, verify=False, timeout=5)
+            if tr.status_code == 200:
+                active_servers.append(sv) # Çalışanı listeye ekle
+        except: pass
 
-        browser.close()
-
-        if created > 0:
-            with open(output_filename, "w", encoding="utf-8") as f:
-                f.write("\n".join(m3u_header_lines))
-                f.write("\n")
-                f.write("\n".join(m3u_content))
-            print(f"\n\n📂 {created} kanal başarıyla '{output_filename}' dosyasına kaydedildi.")
-        else:
-            print("\n\nℹ️  Geçerli hiçbir M3U8 linki oluşturulamadığı için dosya oluşturulmadı.")
-
-        print("\n🎉 İşlem tamamlandı!")
+    if active_servers:
+        with open(FILE_NAME, "w", encoding="utf-8") as f:
+            f.write("#EXTM3U\n")
+            
+            # Bulunan her sunucu için listeyi döngüye sok
+            for srv in active_servers:
+                for cid, cname in channels:
+                    furl = f"{srv}/{cid}.m3u8" if "checklist" in srv else f"{srv}/checklist/{cid}.m3u8"
+                    furl = furl.replace("checklist//", "checklist/")
+                    
+                    line = f'#EXTINF:-1 tvg-id="sport.tr" tvg-name="{cname}" tvg-logo="https://i.hizliresim.com/8xzjgqv.jpg" group-title="Andro-Panel",{cname}\n{furl}\n'
+                    f.write(line)
+                    
+        print(f"{FILE_NAME} Saved ({len(active_servers)} servers found).")
 
 if __name__ == "__main__":
     main()
