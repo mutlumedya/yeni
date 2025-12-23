@@ -1,0 +1,20 @@
+version: '3.9'
+
+services:
+  taraftar:
+    build: .
+    container_name: taraftar-bot
+    restart: unless-stopped
+    volumes:
+      - ./andro-panel.m3u:/app/andro-panel.m3u
+    environment:
+      - TZ=Europe/Istanbul
+    command: >
+      sh -c "
+      while true; do
+        echo \"[$(date '+%Y-%m-%d %H:%M:%S')] Taraftar playlist güncelleniyor...\";
+        python taraftar.py;
+        echo \"[$(date '+%Y-%m-%d %H:%M:%S')] Güncelleme tamamlandı. Bir sonraki güncelleme 1 saat sonra.\";
+        sleep 3600;
+      done
+      "
