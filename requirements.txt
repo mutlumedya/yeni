@@ -2,5 +2,6 @@ python-telegram-bot>=20.0
 httpx>=0.24.0
 requests>=2.28.0
 flask
+beautifulsoup4
 gunicorn
 gevent
