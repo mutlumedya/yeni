@@ -7,8 +7,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def main():
     PROXY = "https://proxy.freecdn.workers.dev/?url="
-    START = "https://taraftarium24com-amp.xyz/"
-    FILE_NAME = "andro-panel.m3u"
+    START = "https://taraftariumizle.org/"
+    FILE_NAME = "mutluapk.m3u"
     
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
